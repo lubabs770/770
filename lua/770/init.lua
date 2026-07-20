@@ -155,6 +155,10 @@ function M.maybe_run()
   if vim.b[bufnr].claude770_running then return end
   local tag = find_tag(bufnr, M.config.tag)
   if not tag or tag.instruction == "" then return end
+  -- The @claude line is kept after a run, so guard against re-firing on every
+  -- InsertLeave: skip if we already answered this exact instruction. Editing
+  -- the instruction changes the signature and lets it run again.
+  if vim.b[bufnr].claude770_last == tag.instruction then return end
   M.run()
 end
 
@@ -196,11 +200,12 @@ function M.run()
     "Instruction: " .. instruction,
   }, "\n")
 
-  -- Remove the @claude line; generated blocks are inserted in its place and the
-  -- spinner rides at the END of the last written line (no dedicated blank line,
-  -- so it never occupies a buffer line of its own).
-  vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, {})
-  local insert_row = tag.row
+  -- Keep the @claude line as a record; generated blocks are inserted on the
+  -- line(s) directly BELOW it. The spinner rides the EOL of the last written
+  -- line (the @claude line itself until the first block arrives), so it never
+  -- occupies a buffer line of its own.
+  local insert_row = tag.row + 1
+  local produced = false
   local first_block = true
 
   ------------------------------------------------------------------------------
@@ -211,9 +216,9 @@ function M.run()
   local function spinner_draw()
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
     local last = math.max(0, vim.api.nvim_buf_line_count(bufnr) - 1)
-    -- sit on the last written output line; before any output exists, fall back
-    -- to the line just above the insertion point.
-    local row = insert_row > tag.row and (insert_row - 1) or math.max(0, tag.row - 1)
+    -- sit on the last written output line; before any output exists, sit on the
+    -- @claude line itself.
+    local row = produced and (insert_row - 1) or tag.row
     row = math.min(row, last)
     local opts = {
       virt_text = { { spinner_frames[spin_i] .. " claude", "Comment" } },
@@ -243,8 +248,8 @@ function M.run()
     return out
   end
 
-  -- Insert one block above the placeholder spinner line, so the placeholder
-  -- (and its spinner) stays at insert_row, trailing the output.
+  -- Insert one block below the @claude line, advancing the insertion point so
+  -- subsequent blocks (and the trailing spinner) follow the growing output.
   local function on_block(lines)
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
     lines = strip_fences(lines)
@@ -257,6 +262,7 @@ function M.run()
     if #lines == 0 then return end
     vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row, false, lines)
     insert_row = insert_row + #lines
+    produced = true
     if cfg.spinner then spinner_draw() end
   end
 
@@ -299,12 +305,17 @@ function M.run()
       spinner_stop()
       if vim.api.nvim_buf_is_valid(bufnr) then
         -- trim a single trailing blank line the model may have emitted
-        if insert_row > tag.row then
+        if produced then
           local prev = vim.api.nvim_buf_get_lines(bufnr, insert_row - 1, insert_row, false)[1]
           if prev == "" then
             vim.api.nvim_buf_set_lines(bufnr, insert_row - 1, insert_row, false, {})
             insert_row = insert_row - 1
           end
+        end
+        -- remember this instruction so auto mode doesn't re-fire on every
+        -- InsertLeave (the @claude line is kept in the buffer).
+        if not had_error and code == 0 then
+          vim.b[bufnr].claude770_last = tag.instruction
         end
         vim.b[bufnr].claude770_running = false
       end
