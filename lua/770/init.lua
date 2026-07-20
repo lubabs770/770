@@ -196,22 +196,25 @@ function M.run()
     "Instruction: " .. instruction,
   }, "\n")
 
-  -- Replace the @claude line with an empty placeholder line that carries the
-  -- spinner. Streamed blocks are inserted ABOVE it, so it always trails the
-  -- output; it's removed when generation finishes.
-  vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, { "" })
+  -- Remove the @claude line; generated blocks are inserted in its place and the
+  -- spinner rides at the END of the last written line (no dedicated blank line,
+  -- so it never occupies a buffer line of its own).
+  vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, {})
   local insert_row = tag.row
   local first_block = true
 
   ------------------------------------------------------------------------------
-  -- Inline spinner: an extmark that trails the growing output and animates.
+  -- Inline spinner: an extmark at the EOL of the last generated line.
   ------------------------------------------------------------------------------
   local mark_id, timer
   local spin_i = 1
   local function spinner_draw()
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
-    -- insert_row is always the placeholder (spinner) line.
-    local row = math.min(insert_row, math.max(0, vim.api.nvim_buf_line_count(bufnr) - 1))
+    local last = math.max(0, vim.api.nvim_buf_line_count(bufnr) - 1)
+    -- sit on the last written output line; before any output exists, fall back
+    -- to the line just above the insertion point.
+    local row = insert_row > tag.row and (insert_row - 1) or math.max(0, tag.row - 1)
+    row = math.min(row, last)
     local opts = {
       virt_text = { { spinner_frames[spin_i] .. " claude", "Comment" } },
       virt_text_pos = "eol",
@@ -254,6 +257,7 @@ function M.run()
     if #lines == 0 then return end
     vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row, false, lines)
     insert_row = insert_row + #lines
+    if cfg.spinner then spinner_draw() end
   end
 
   local streamer = Streamer.new(on_block)
@@ -294,8 +298,14 @@ function M.run()
       streamer:finish()
       spinner_stop()
       if vim.api.nvim_buf_is_valid(bufnr) then
-        -- drop the trailing empty placeholder (spinner) line
-        vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row + 1, false, {})
+        -- trim a single trailing blank line the model may have emitted
+        if insert_row > tag.row then
+          local prev = vim.api.nvim_buf_get_lines(bufnr, insert_row - 1, insert_row, false)[1]
+          if prev == "" then
+            vim.api.nvim_buf_set_lines(bufnr, insert_row - 1, insert_row, false, {})
+            insert_row = insert_row - 1
+          end
+        end
         vim.b[bufnr].claude770_running = false
       end
       if code ~= 0 and not had_error then
