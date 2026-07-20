@@ -185,14 +185,38 @@ function M.run()
   vim.b[bufnr].claude770_running = true
 
   local filetype = vim.bo[bufnr].filetype
+  -- Comment leader for this buffer (e.g. "//", "--", "#"), derived from
+  -- 'commentstring'. Used to keep non-code text from breaking the LSP.
+  local leader
+  do
+    local cs = vim.bo[bufnr].commentstring
+    local pre = cs and cs ~= "" and cs:match("^(.-)%%s")
+    if pre and vim.trim(pre) ~= "" then leader = vim.trim(pre) end
+  end
+
   local buffer_text = table.concat(tag.lines, "\n")
   local instruction = tag.instruction ~= "" and tag.instruction
     or "Do what the @claude tag implies from surrounding context."
 
+  local comment_rule = leader
+      and ("This is "
+        .. (filetype ~= "" and filetype or "source")
+        .. " code. Your output is inserted verbatim below the "
+        .. cfg.tag
+        .. " line. EVERY line that is not valid code MUST be a line comment "
+        .. "starting with `" .. leader .. " ` — headings, notes, explanations, "
+        .. "prose, everything. Never emit a bare prose line; it would be a "
+        .. "syntax error and break the language server.")
+    or ("Your output is inserted verbatim below the " .. cfg.tag .. " line.")
+
   local prompt = table.concat({
     "Filetype: " .. (filetype ~= "" and filetype or "plaintext"),
+    "Comment syntax: " .. (leader and (leader .. " <text>") or "(none — plain text buffer)"),
     "",
-    "Current buffer (the " .. cfg.tag .. " line is where your output goes):",
+    comment_rule,
+    "",
+    "Current buffer (insert your output on the line(s) directly below the "
+      .. cfg.tag .. " line):",
     "----",
     buffer_text,
     "----",
@@ -200,10 +224,19 @@ function M.run()
     "Instruction: " .. instruction,
   }, "\n")
 
-  -- Keep the @claude line as a record; generated blocks are inserted on the
-  -- line(s) directly BELOW it. The spinner rides the EOL of the last written
-  -- line (the @claude line itself until the first block arrives), so it never
-  -- occupies a buffer line of its own.
+  -- Keep the @claude line as a record, but comment it out first so the raw
+  -- instruction text doesn't break the LSP. Generated blocks are inserted on
+  -- the line(s) directly BELOW it. The spinner rides the EOL of the last
+  -- written line (the @claude line itself until the first block arrives), so it
+  -- never occupies a buffer line of its own.
+  if leader then
+    local tagline = tag.lines[tag.row + 1] or ""
+    if not tagline:match("^%s*" .. vim.pesc(leader)) then
+      local indent = tagline:match("^%s*") or ""
+      local body = tagline:sub(#indent + 1)
+      vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, { indent .. leader .. " " .. body })
+    end
+  end
   local insert_row = tag.row + 1
   local produced = false
   local first_block = true
