@@ -1,23 +1,44 @@
--- 770: tag @claude in a buffer, the local `claude` CLI reads the buffer and
--- streams a reply back one *logic block* at a time (fn / var / obj), not token
--- by token. Inspired by ThePrimeagen/99.
+-- 770: tag @claude in a buffer, the local `claude` CLI runs as an *agent* on that
+-- file — reading it with its own tools and editing it directly — then the buffer
+-- refreshes in place. Inspired by ThePrimeagen/99.
+--
+-- Two modes, chosen by the agent from your instruction:
+--   * prose / question ask  -> reply is written as COMMENT lines below @claude
+--     (the @claude line is kept)
+--   * code / edit / git ask -> the code is edited directly and the executed
+--     @claude directive line is removed
+-- 770 itself never inserts text into the buffer; the agent owns every edit.
 
 local M = {}
 
 M.config = {
-  cli = "claude",       -- local Claude Code binary
-  model = nil,          -- nil = CLI default; else passed as --model
-  tag = "@claude",      -- pattern to look for in the buffer
-  keymap = "<leader>cc", -- manual trigger (set false to disable)
-  auto = true,          -- fire automatically on InsertLeave when a @claude line has an instruction
-  notify = true,        -- info/status messages (errors always show)
-  spinner = true,       -- inline spinner while generating
-  system = [[You are embedded in a text editor buffer. The user tagged you with @claude.
-Output ONLY the content that should be inserted into the buffer to satisfy the
-instruction. Do NOT wrap output in markdown code fences (```). No explanations,
-no preamble. Write in the buffer's language. Emit complete logical units (a full
-function, variable, object, or statement) so the editor can stream your output
-block by block.]],
+  cli = "claude",           -- local Claude Code binary
+  model = nil,              -- nil = CLI default; else passed as --model
+  tag = "@claude",          -- pattern to look for in the buffer
+  keymap = "<leader>cc",    -- manual trigger (set false to disable)
+  auto = true,              -- fire automatically on InsertLeave when a @claude line has an instruction
+  notify = true,            -- info/status messages (errors always show)
+  spinner = true,           -- inline status spinner while the agent works
+  permission_mode = "acceptEdits", -- --permission-mode (use "bypassPermissions" for anything)
+  -- Tools the agent may use without an (impossible, headless) permission prompt.
+  -- Listing Bash auto-approves it so git operations run un-prompted.
+  allowed_tools = { "Read", "Edit", "Write", "MultiEdit", "Bash", "Grep", "Glob" },
+  add_dir = nil,            -- optional extra --add-dir (e.g. a repo root outside cwd)
+  system = [[You are invoked by a Neovim plugin ("770") on a single open file. A
+comment in that file tags you: `@claude <instruction>`. Respond by EDITING THE
+FILE DIRECTLY with your tools — never just print an answer, printed text is
+discarded and never reaches the user.
+
+Decide from the instruction which mode applies:
+(a) Question / explanation / prose request -> write your reply as COMMENT lines
+    (using the buffer's comment syntax, given in the prompt) inserted directly
+    BELOW the @claude line, and KEEP the @claude line.
+(b) Code change / edit / refactor / git task -> make the change directly in the
+    file and REMOVE the executed @claude directive line.
+
+Never leave uncommented prose anywhere in the file — it is a syntax error and
+breaks the language server. Prefer minimal, correct edits. Use git via Bash only
+if the instruction requires it. Work only within this file and its repository.]],
 }
 
 local ns = vim.api.nvim_create_namespace("claude770")
@@ -29,10 +50,10 @@ function M.setup(opts)
   -- Manual trigger (command name can't start with a digit → Run770).
   vim.api.nvim_create_user_command("Run770", function()
     M.run()
-  end, { desc = "Read @claude tag, stream reply block by block" })
+  end, { desc = "Run the @claude agent on this file" })
 
   if M.config.keymap then
-    vim.keymap.set("n", M.config.keymap, M.run, { desc = "770: run @claude tag" })
+    vim.keymap.set("n", M.config.keymap, M.run, { desc = "770: run @claude agent" })
   end
 
   if M.config.auto then
@@ -54,61 +75,7 @@ local function notify(msg, level)
 end
 
 --------------------------------------------------------------------------------
--- Streamer: turns a stream of text deltas into whole logic blocks.
---
--- A block boundary is declared when either:
---   * a blank line appears (paragraph / statement separator), or
---   * a new line starts at column 0 while we already have buffered content
---     (a new top-level construct — fn/var/obj/class — is beginning).
--- Everything indented under the current top-level line stays in the same block.
---------------------------------------------------------------------------------
-local Streamer = {}
-Streamer.__index = Streamer
-
-function Streamer.new(on_block)
-  return setmetatable({ buf = "", block = {}, on_block = on_block }, Streamer)
-end
-
-function Streamer:_flush()
-  if #self.block > 0 then
-    self.on_block(self.block)
-    self.block = {}
-  end
-end
-
-function Streamer:_line(line)
-  if line:match("^%s*$") then          -- blank: close current block
-    table.insert(self.block, line)
-    self:_flush()
-  elseif line:match("^%S") and #self.block > 0 then
-    self:_flush()                      -- new top-level unit: flush previous
-    table.insert(self.block, line)
-  else
-    table.insert(self.block, line)     -- continuation of current unit
-  end
-end
-
-function Streamer:feed(text)
-  self.buf = self.buf .. text
-  while true do
-    local nl = self.buf:find("\n")
-    if not nl then break end
-    local line = self.buf:sub(1, nl - 1):gsub("\r$", "")
-    self.buf = self.buf:sub(nl + 1)
-    self:_line(line)
-  end
-end
-
-function Streamer:finish()
-  if self.buf ~= "" then
-    self:_line((self.buf:gsub("\r$", "")))
-    self.buf = ""
-  end
-  self:_flush()
-end
-
---------------------------------------------------------------------------------
--- Buffer scan: find the @claude tag, its instruction, and where to write.
+-- Buffer scan: find the @claude tag and its instruction.
 --------------------------------------------------------------------------------
 local function find_tag(bufnr, tag)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -119,7 +86,6 @@ local function find_tag(bufnr, tag)
       return {
         row = i - 1,                             -- 0-indexed line of the tag
         instruction = vim.trim(line:sub(e + 1)), -- text after @claude on that line
-        lines = lines,
       }
     end
   end
@@ -127,16 +93,38 @@ local function find_tag(bufnr, tag)
 end
 
 --------------------------------------------------------------------------------
--- JSONL line from `claude --output-format stream-json`.
+-- One JSONL line from `claude --output-format stream-json`. We only care about
+-- surfacing which tool the agent is running (for the status spinner) and errors.
 --------------------------------------------------------------------------------
-local function handle_json_line(line, streamer, on_error)
+local function tool_hint(name, input)
+  local hint = name or "tool"
+  if type(input) == "table" then
+    if input.file_path then
+      hint = hint .. " " .. vim.fn.fnamemodify(input.file_path, ":t")
+    elseif input.command then
+      hint = hint .. " " .. tostring(input.command):gsub("%s+", " "):sub(1, 32)
+    elseif input.pattern then
+      hint = hint .. " " .. tostring(input.pattern):sub(1, 24)
+    end
+  end
+  return hint
+end
+
+local function handle_json_line(line, on_status, on_error)
   local ok, obj = pcall(vim.json.decode, line)
   if not ok or type(obj) ~= "table" then return end
 
   if obj.type == "stream_event" and obj.event then
     local ev = obj.event
-    if ev.type == "content_block_delta" and ev.delta and ev.delta.type == "text_delta" then
-      streamer:feed(ev.delta.text)
+    -- quick status the moment a tool block opens (input may still be streaming)
+    if ev.type == "content_block_start" and ev.content_block
+        and ev.content_block.type == "tool_use" then
+      on_status(tool_hint(ev.content_block.name, ev.content_block.input))
+    end
+  elseif obj.type == "assistant" and obj.message and obj.message.content then
+    -- full (non-partial) assistant message: tool_use carries complete input
+    for _, c in ipairs(obj.message.content) do
+      if c.type == "tool_use" then on_status(tool_hint(c.name, c.input)) end
     end
   elseif obj.type == "result" and obj.is_error then
     on_error(obj.result or obj.subtype or "CLI reported an error")
@@ -155,9 +143,9 @@ function M.maybe_run()
   if vim.b[bufnr].claude770_running then return end
   local tag = find_tag(bufnr, M.config.tag)
   if not tag or tag.instruction == "" then return end
-  -- The @claude line is kept after a run, so guard against re-firing on every
-  -- InsertLeave: skip if we already answered this exact instruction. Editing
-  -- the instruction changes the signature and lets it run again.
+  -- The @claude line may be kept after a run (prose asks), so guard against
+  -- re-firing on every InsertLeave: skip if we already answered this exact
+  -- instruction. Editing the instruction changes the signature and re-runs it.
   if vim.b[bufnr].claude770_last == tag.instruction then return end
   M.run()
 end
@@ -176,85 +164,67 @@ function M.run()
   local bufnr = vim.api.nvim_get_current_buf()
   if vim.b[bufnr].claude770_running then return end
 
+  -- Agentic mode edits a file on disk, so we need a real, named file buffer.
+  if vim.bo[bufnr].buftype ~= "" then
+    notify("agentic mode needs a normal file buffer", vim.log.levels.WARN)
+    return
+  end
+  local fname = vim.api.nvim_buf_get_name(bufnr)
+  if fname == "" then
+    notify("agentic mode needs a saved file (name/write the buffer first)", vim.log.levels.WARN)
+    return
+  end
+
   local tag = find_tag(bufnr, cfg.tag)
   if not tag then
     notify("no " .. cfg.tag .. " tag found in buffer", vim.log.levels.WARN)
     return
   end
+  local instruction = tag.instruction ~= "" and tag.instruction
+    or "Do what the " .. cfg.tag .. " tag implies from surrounding context."
 
   vim.b[bufnr].claude770_running = true
 
-  local filetype = vim.bo[bufnr].filetype
-  -- Comment leader for this buffer (e.g. "//", "--", "#"), derived from
-  -- 'commentstring'. Used to keep non-code text from breaking the LSP.
-  local leader
-  do
-    local cs = vim.bo[bufnr].commentstring
-    local pre = cs and cs ~= "" and cs:match("^(.-)%%s")
-    if pre and vim.trim(pre) ~= "" then leader = vim.trim(pre) end
+  -- Save so the agent reads current content; enable autoread so the in-place
+  -- refresh on completion is silent.
+  if vim.bo[bufnr].modified then
+    vim.api.nvim_buf_call(bufnr, function() vim.cmd("silent keepalt write") end)
   end
+  vim.o.autoread = true
 
-  local buffer_text = table.concat(tag.lines, "\n")
-  local instruction = tag.instruction ~= "" and tag.instruction
-    or "Do what the @claude tag implies from surrounding context."
+  local filetype = vim.bo[bufnr].filetype
+  local cs = vim.bo[bufnr].commentstring
+  local comment_hint = (cs and cs ~= "")
+      and ("Comment syntax for this buffer: `" .. (cs:gsub("%%s", "<text>")) .. "`")
+    or "This buffer has no comment syntax (treat as plain text)."
 
-  local comment_rule = leader
-      and ("This is "
-        .. (filetype ~= "" and filetype or "source")
-        .. " code. Your output is inserted verbatim below the "
-        .. cfg.tag
-        .. " line. EVERY line that is not valid code MUST be a line comment "
-        .. "starting with `" .. leader .. " ` — headings, notes, explanations, "
-        .. "prose, everything. Never emit a bare prose line; it would be a "
-        .. "syntax error and break the language server.")
-    or ("Your output is inserted verbatim below the " .. cfg.tag .. " line.")
+  -- Run from the git root (fall back to the file's dir) so relative paths + git
+  -- resolve correctly.
+  local dir = vim.fn.fnamemodify(fname, ":h")
+  local root = vim.fn.systemlist({ "git", "-C", dir, "rev-parse", "--show-toplevel" })[1]
+  local cwd = (vim.v.shell_error == 0 and root and root ~= "") and root or dir
 
   local prompt = table.concat({
+    "File: " .. fname,
     "Filetype: " .. (filetype ~= "" and filetype or "plaintext"),
-    "Comment syntax: " .. (leader and (leader .. " <text>") or "(none — plain text buffer)"),
-    "",
-    comment_rule,
-    "",
-    "Current buffer (insert your output on the line(s) directly below the "
-      .. cfg.tag .. " line):",
-    "----",
-    buffer_text,
-    "----",
+    comment_hint,
+    "The " .. cfg.tag .. " tag is on line " .. (tag.row + 1) .. ".",
     "",
     "Instruction: " .. instruction,
   }, "\n")
 
-  -- Keep the @claude line as a record, but comment it out first so the raw
-  -- instruction text doesn't break the LSP. Generated blocks are inserted on
-  -- the line(s) directly BELOW it. The spinner rides the EOL of the last
-  -- written line (the @claude line itself until the first block arrives), so it
-  -- never occupies a buffer line of its own.
-  if leader then
-    local tagline = tag.lines[tag.row + 1] or ""
-    if not tagline:match("^%s*" .. vim.pesc(leader)) then
-      local indent = tagline:match("^%s*") or ""
-      local body = tagline:sub(#indent + 1)
-      vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, { indent .. leader .. " " .. body })
-    end
-  end
-  local insert_row = tag.row + 1
-  local produced = false
-  local first_block = true
-
   ------------------------------------------------------------------------------
-  -- Inline spinner: an extmark at the EOL of the last generated line.
+  -- Inline status spinner: an extmark at the EOL of the @claude line, showing
+  -- what the agent is currently doing.
   ------------------------------------------------------------------------------
-  local mark_id, timer
-  local spin_i = 1
+  local status = "thinking…"
+  local mark_id, timer, spin_i = nil, nil, 1
   local function spinner_draw()
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
     local last = math.max(0, vim.api.nvim_buf_line_count(bufnr) - 1)
-    -- sit on the last written output line; before any output exists, sit on the
-    -- @claude line itself.
-    local row = produced and (insert_row - 1) or tag.row
-    row = math.min(row, last)
+    local row = math.min(tag.row, last)
     local opts = {
-      virt_text = { { spinner_frames[spin_i] .. " claude", "Comment" } },
+      virt_text = { { spinner_frames[spin_i] .. " claude: " .. status, "Comment" } },
       virt_text_pos = "eol",
     }
     if mark_id then opts.id = mark_id end
@@ -273,53 +243,40 @@ function M.run()
     end, { ["repeat"] = -1 })
   end
 
-  local function strip_fences(lines)
-    local out = {}
-    for _, l in ipairs(lines) do
-      if not l:match("^%s*```") then table.insert(out, l) end
-    end
-    return out
-  end
-
-  -- Insert one block below the @claude line, advancing the insertion point so
-  -- subsequent blocks (and the trailing spinner) follow the growing output.
-  local function on_block(lines)
-    if not vim.api.nvim_buf_is_valid(bufnr) then return end
-    lines = strip_fences(lines)
-    if first_block then
-      while #lines > 0 and lines[1]:match("^%s*$") do
-        table.remove(lines, 1)
-      end
-      first_block = false
-    end
-    if #lines == 0 then return end
-    vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row, false, lines)
-    insert_row = insert_row + #lines
-    produced = true
-    if cfg.spinner then spinner_draw() end
-  end
-
-  local streamer = Streamer.new(on_block)
   local had_error = false
   local function on_error(msg)
     had_error = true
     notify(msg, vim.log.levels.ERROR)
   end
+  local function on_status(s)
+    status = s
+    if cfg.spinner then spinner_draw() end
+  end
 
-  local partial = ""
   local cmd = {
     cfg.cli, "-p",
     "--output-format", "stream-json",
     "--include-partial-messages",
     "--verbose",
+    "--permission-mode", cfg.permission_mode,
     "--append-system-prompt", cfg.system,
   }
+  if cfg.allowed_tools and #cfg.allowed_tools > 0 then
+    table.insert(cmd, "--allowedTools")
+    for _, t in ipairs(cfg.allowed_tools) do table.insert(cmd, t) end
+  end
+  if cfg.add_dir then
+    table.insert(cmd, "--add-dir")
+    table.insert(cmd, cfg.add_dir)
+  end
   if cfg.model then
     table.insert(cmd, "--model")
     table.insert(cmd, cfg.model)
   end
 
+  local partial = ""
   local jobid = vim.fn.jobstart(cmd, {
+    cwd = cwd,
     on_stdout = function(_, data, _)
       if not data then return end
       partial = partial .. table.concat(data, "\n")
@@ -329,32 +286,30 @@ function M.run()
         local line = partial:sub(1, nl - 1):gsub("\r$", "")
         partial = partial:sub(nl + 1)
         if line ~= "" then
-          handle_json_line(line, streamer, on_error)
+          handle_json_line(line, on_status, on_error)
         end
       end
     end,
     on_exit = function(_, code, _)
-      streamer:finish()
       spinner_stop()
       if vim.api.nvim_buf_is_valid(bufnr) then
-        -- trim a single trailing blank line the model may have emitted
-        if produced then
-          local prev = vim.api.nvim_buf_get_lines(bufnr, insert_row - 1, insert_row, false)[1]
-          if prev == "" then
-            vim.api.nvim_buf_set_lines(bufnr, insert_row - 1, insert_row, false, {})
-            insert_row = insert_row - 1
-          end
+        -- Refresh the SAME buffer from disk in place — never close/replace it.
+        -- checktime silently reloads an unmodified buffer whose file changed.
+        if not vim.bo[bufnr].modified then
+          vim.api.nvim_buf_call(bufnr, function() vim.cmd("silent! checktime") end)
+        else
+          notify("buffer edited in nvim during run; not reloading (claude edited the file on disk)", vim.log.levels.WARN)
         end
-        -- remember this instruction so auto mode doesn't re-fire on every
-        -- InsertLeave (the @claude line is kept in the buffer).
+        -- Remember this instruction so auto mode doesn't re-fire on every
+        -- InsertLeave when the @claude line is kept (prose asks).
         if not had_error and code == 0 then
-          vim.b[bufnr].claude770_last = tag.instruction
+          vim.b[bufnr].claude770_last = instruction
         end
         vim.b[bufnr].claude770_running = false
       end
       if code ~= 0 and not had_error then
         notify(cfg.cli .. " exited " .. code, vim.log.levels.ERROR)
-      else
+      elseif not had_error then
         notify("done")
       end
     end,
