@@ -107,6 +107,9 @@ function Streamer:finish()
   self:_flush()
 end
 
+-- Exposed for tests; not part of the public API.
+M._Streamer = Streamer
+
 --------------------------------------------------------------------------------
 -- Buffer scan: find the @claude tag, its instruction, and where to write.
 --------------------------------------------------------------------------------

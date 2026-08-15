@@ -71,3 +71,13 @@ end
 ## Command name
 
 Vim user commands can't start with a digit, so it's `:Run770`, not `:770`.
+
+## Tests
+
+The block splitter (the core streaming logic) has headless tests:
+
+```
+nvim -l test/streamer_spec.lua
+```
+
+Exits non-zero on failure.
