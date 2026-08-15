@@ -198,7 +198,9 @@ function M.run()
 
   -- Replace the @claude line with an empty placeholder line that carries the
   -- spinner. Streamed blocks are inserted ABOVE it, so it always trails the
-  -- output; it's removed when generation finishes.
+  -- output; it's removed when generation finishes. Keep the original text so we
+  -- can restore it if the job never starts.
+  local orig_line = tag.lines[tag.row + 1] or ""
   vim.api.nvim_buf_set_lines(bufnr, tag.row, tag.row + 1, false, { "" })
   local insert_row = tag.row
   local first_block = true
@@ -310,6 +312,11 @@ function M.run()
 
   if jobid <= 0 then
     spinner_stop()
+    -- Restore the @claude line we replaced with the placeholder, so the user's
+    -- instruction isn't silently lost when the job fails to start.
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row + 1, false, { orig_line })
+    end
     vim.b[bufnr].claude770_running = false
     notify("failed to start " .. cfg.cli, vim.log.levels.ERROR)
     return
