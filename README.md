@@ -61,9 +61,12 @@ end
 |----------|----------------|-------------------------------------------|
 | `cli`    | `"claude"`     | binary to invoke                          |
 | `model`  | `nil`          | `--model` value; nil = CLI default        |
-| `tag`    | `"@claude"`    | marker scanned for in the buffer          |
-| `keymap` | `"<leader>cc"` | normal-mode mapping (set `false` to skip) |
-| `system` | (see source)   | appended system prompt                    |
+| `tag`     | `"@claude"`    | marker scanned for in the buffer          |
+| `keymap`  | `"<leader>cc"` | normal-mode mapping (set `false` to skip) |
+| `auto`    | `true`         | auto-fire on `InsertLeave` when a `@claude` line has an instruction |
+| `notify`  | `true`         | info/status messages (errors always show) |
+| `spinner` | `true`         | inline spinner while generating           |
+| `system`  | (see source)   | appended system prompt                    |
 
 ## Command name
 
