@@ -298,7 +298,9 @@ function M.run()
         vim.api.nvim_buf_set_lines(bufnr, insert_row, insert_row + 1, false, {})
         vim.b[bufnr].claude770_running = false
       end
-      if code ~= 0 and not had_error then
+      if had_error then
+        -- error already surfaced by on_error; don't also claim success
+      elseif code ~= 0 then
         notify(cfg.cli .. " exited " .. code, vim.log.levels.ERROR)
       else
         notify("done")
