@@ -72,6 +72,11 @@ end
 
 Vim user commands can't start with a digit, so it's `:Run770`, not `:770`.
 
+## Health check
+
+Run `:checkhealth 770` to verify your setup — Neovim version, that the `claude`
+CLI is on your `PATH`, and the active model.
+
 ## Tests
 
 The block splitter (the core streaming logic) has headless tests:
