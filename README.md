@@ -79,10 +79,11 @@ CLI is on your `PATH`, and the active model.
 
 ## Tests
 
-The block splitter (the core streaming logic) has headless tests:
+The core streaming logic has headless tests:
 
 ```
-nvim -l test/streamer_spec.lua
+nvim -l test/streamer_spec.lua    # block splitter
+nvim -l test/json_line_spec.lua   # CLI JSONL parser
 ```
 
-Exits non-zero on failure.
+Each exits non-zero on failure.

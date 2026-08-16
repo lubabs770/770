@@ -148,6 +148,9 @@ local function handle_json_line(line, streamer, on_error)
   end
 end
 
+-- Exposed for tests; not part of the public API.
+M._handle_json_line = handle_json_line
+
 --------------------------------------------------------------------------------
 -- Auto-trigger guard: fire only when a @claude line carries an instruction and
 -- nothing is already running in this buffer.
